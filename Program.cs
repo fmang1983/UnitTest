@@ -1,226 +1,487 @@
 ﻿using System;
-using System.Data.Odbc;
-using System.Data.SqlClient;
-using System.Text.RegularExpressions;
-using System.Linq;
-using System.Data;
-using System.Text;
 using System.Configuration;
+using Amazon.S3;
+using System.Data.SqlClient;
+using Amazon.S3.Model;
+using System.IO;
+using System.Data;
 using System.Security.Cryptography;
+using System.Text;
+using System.Linq;
+using System.Text.RegularExpressions;
 using System.Collections.Generic;
+using System.Data.Odbc;
+using Amazon.Runtime.CredentialManagement;
+using System.Threading;
 using System.Diagnostics;
 
-
-namespace MultipleSproc
+namespace ProcExportDocumentLineDetail
 {
     class Program
     {
-
         static DataTable QueryOps(SqlConnection Conn, DataRow Row, string Sproc, string[] Param)
         {
-            /*if sproc is procTopLine, then fill in the table structure */
             var SqlCount = new DataTable();
-            if (Sproc == "procTopLine")
 
+            try
             {
 
-                SqlCount.Columns.Add("CompanyId");
-                SqlCount.Columns.Add("CompanyName");
-                SqlCount.Columns.Add("DocumentCount");
-                SqlCount.Columns.Add("TotalSalesAmount", typeof(int));
-                SqlCount.Columns.Add("Discount", typeof(int));
-                SqlCount.Columns.Add("TotalExempt", typeof(int));
-                SqlCount.Columns.Add("TaxableSales", typeof(int));
-                SqlCount.Columns.Add("TotalSalesTaxAmount", typeof(int));
+                /*Call sproc with values from each row in parameters data table*/
 
+                SqlCommand Proc = new SqlCommand("procExportDocumentLineDetail", Conn);
+                Proc.CommandType = CommandType.StoredProcedure;
+                /* Proc.Parameters.AddWithValue("@AccountId", Row[0]);
+                 Proc.Parameters.AddWithValue("@CompanyId", Row[1]);
+                 Proc.Parameters.AddWithValue("@StartDate", Row[2]);
+                 Proc.Parameters.AddWithValue("@EndDate", Row[3]);
+                 Proc.Parameters.AddWithValue("@StartCode", Row[4]);
+                 Proc.Parameters.AddWithValue("@EndCode", Row[5]);
+                 Proc.Parameters.AddWithValue("@Country", Row[6]);
+                 Proc.Parameters.AddWithValue("@State", Row[7]);
+                 Proc.Parameters.AddWithValue("@DocumentStatusId", Row[8]);
+                 Proc.Parameters.AddWithValue("@DocType", Row[9]);
+                 Proc.Parameters.AddWithValue("@CountryId", Row[10]);
+                 Proc.Parameters.AddWithValue("@DateFilter", Row[11]);
+                 Proc.Parameters.AddWithValue("@CurrencyCode", Row[12]);
+                 Proc.Parameters.AddWithValue("@ParentId", Row[13]); */
 
-                try
+                for (int i = 0; i < Row.Table.Columns.Count - 2; i++)
                 {
+                    Console.WriteLine("@" + Param[i] + Row[i]);
+                    Proc.Parameters.AddWithValue("@" + Param[i], Row[i]);
+                }
 
 
-                    /*Call sproc with values from each row in parameters data table*/
+                var getTimer = Stopwatch.StartNew();
 
-                    SqlCommand Proc = new SqlCommand("dbo." + Sproc, Conn);
-                    Proc.CommandType = CommandType.StoredProcedure;
+                /*Export Sql Data to DataTable*/
 
-                    for (int i = 0; i < Row.Table.Columns.Count - 1; i++)
+                using (var GetResults = new SqlDataAdapter(Proc))
+
+                {
+                    GetResults.Fill(SqlCount);
+
+
+                }
+
+                getTimer.Stop();
+
+                double ElapseTime = Math.Round(getTimer.ElapsedMilliseconds / 1000.00, 2);
+
+                foreach (DataColumn col in SqlCount.Columns)
+                {
+                    if (col.ColumnName.Contains("CompanyName"))
                     {
-                        Console.WriteLine("@" + Param[i] + Row[i]);
-                        Proc.Parameters.AddWithValue("@" + Param[i], Row[i]);
+                        for (int i = 0; i < SqlCount.Rows.Count; i++)
+                        {
+                            if ((SqlCount.Rows[i]["CompanyName"].ToString().Contains("'")))
+                            {
+                                SqlCount.Rows[i]["CompanyName"] = SqlCount.Rows[i]["CompanyName"].ToString().Replace("'", "\\'");
+
+                            }
+
+                        }
                     }
+                }
 
+                var hashes = new List<string>();
+                
+                var values = new List<string>();
 
-                    var getTimer = Stopwatch.StartNew();
+                /*Transform Data to align with Snowflake*/
 
-                    /*Export Sql Data to DataTable*/
-
-                    using (var GetResults = new SqlDataAdapter(Proc))
-
-                    {
-                        GetResults.Fill(SqlCount);
-
-
-                    }
-
-                    getTimer.Stop();
-
-                    double ElapseTime = Math.Round(getTimer.ElapsedMilliseconds/1000.00, 2);
+                foreach (DataRow R in SqlCount.Rows)
+                {
+                    var lists = new List<string>();
 
                     foreach (DataColumn col in SqlCount.Columns)
                     {
-                        if (col.ColumnName.Contains("CompanyName"))
-                        {
-                            for (int i = 0; i < SqlCount.Rows.Count; i++)
-                            {
-                                if ((SqlCount.Rows[i]["CompanyName"].ToString().Contains("'")))
-                                {
-                                    SqlCount.Rows[i]["CompanyName"] = SqlCount.Rows[i]["CompanyName"].ToString().Replace("'", "\\'");
+                        string Pattern = @"^[0-9]+\.[0-9]*";
+                        string Data = R[col].ToString();
+                        Match w = Regex.Match(Data, Pattern);
 
-                                }
+                        if (w.Success)
+                        {
+
+                            lists.Add(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
+                        }
+
+                        else if (col.ColumnName.Contains("Date"))
+                            {
+
+                                string[] Dates = Data.ToString().Split(new char[0]);
+
+
+                                lists.Add(Dates[0]);
 
                             }
-                        }
-                    }
 
-                    SqlCount.Columns.Add(new DataColumn("SqlTime"));
+                            else if (Data.ToLower() == "null")
+                            {
 
-                    for (int i = 0; i < SqlCount.Rows.Count; i++)
-                    {
+                                lists.Add("");
 
-                        SqlCount.Rows[i]["SqlTime"] = ElapseTime;
+                            }
+
+                            else
+                            {
+
+                                lists.Add(Data.ToString().ToLower());
+
+                            }
                         
                     }
+             
+                    var rec = string.Join(",", lists.ToArray());
+                    
+                    values.Add(rec);
+                
+                 }
 
-                    return SqlCount;
-                }
-                catch (Exception Ex)
+                Console.WriteLine(values[0]);
+
+                /*Hash DataRows*/
+
+                foreach (var value in values)
                 {
-                    Console.WriteLine(Ex.Message.ToString());
-                    return null;
+                    using (SHA1Managed sha1 = new SHA1Managed())
+                    {
+
+                        var hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(value));
+
+                        var sb = new StringBuilder(hash.Length * 2);
+
+                        foreach (byte b in hash)
+                        {
+                            // can be "x2" if you want lowercase
+                            sb.Append(b.ToString("X2"));
+
+                        }
+
+                        hashes.Add(sb.ToString());
+                        //Console.WriteLine(sb.ToString());
+                    }
                 }
 
+
+                SqlCount.Columns.Add(new DataColumn("hash"));
+                SqlCount.Columns.Add(new DataColumn("SqlTime"));
+
+                for (int i = 0; i < SqlCount.Rows.Count; i++)
+                {
+
+                    SqlCount.Rows[i]["hash"] = hashes[i];
+                    //Console.WriteLine("sql" + " " + hashes[i]);
+                    SqlCount.Rows[i]["SqlTime"] = ElapseTime;
+                }
+
+                return SqlCount;
 
 
             }
 
-            else
+            catch (SqlException Ex)
             {
+                Console.WriteLine("Sql Server Error - {0}", Ex.Message.ToString());
+                Console.ReadLine();
+                return null;
+            }
+            catch (Exception Ex)
+            {
+                Console.WriteLine("Sql Server Error - {0}", Ex.Message.ToString());
+                Console.ReadLine();
+                return null;
+            }
+        }
+        static string GetHash(OdbcConnection Connect, DataRow Row, string Sproc, string[] variables, string Stage)
+        {
+            try
+            {
+                
+                /*Call sproc with values from each row in parameters data table*/
 
-                try
+                string Call = "(";
+
+                /*Call Snowflake sproc with values from each row in parameters data table*/
+
+
+
+                /*OdbcCommand GetHash = new OdbcCommand("call procExportDocumentLineDetail(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", Conn);
+                GetHash.CommandType = CommandType.StoredProcedure;
+                GetHash.Parameters.AddWithValue("@AccountId", Row[0]);
+                GetHash.Parameters.AddWithValue("@CompanyId", Row[1]);
+                GetHash.Parameters.AddWithValue("@StartDate", Row[2]);
+                GetHash.Parameters.AddWithValue("@EndDate", Row[3]);
+                GetHash.Parameters.AddWithValue("@StartCode", Row[4]);
+                GetHash.Parameters.AddWithValue("@EndCode", Row[5]);
+                GetHash.Parameters.AddWithValue("@Country", Row[6]);
+                GetHash.Parameters.AddWithValue("@State", Row[7]);
+                GetHash.Parameters.AddWithValue("@DocumentStatusId", Row[8]);
+                GetHash.Parameters.AddWithValue("@DocType", Row[9]);
+                GetHash.Parameters.AddWithValue("@CountryId", Row[10]);
+                GetHash.Parameters.AddWithValue("@DateFilter", Row[11]);
+                GetHash.Parameters.AddWithValue("@CurrencyCode", Row[12]);
+                GetHash.Parameters.AddWithValue("@ParentId", Row[13]);
+                GetHash.Parameters.AddWithValue("@StageName", DBNull.Value);
+
+               
+
+                string Hash = (string)GetHash.ExecuteScalar();
+
+                Console.WriteLine(Hash);
+
+                return Hash; */
+
+                for (int i = 0; i < variables.Length + 1; i++)
                 {
-                    var getTimer = Stopwatch.StartNew();
+                    Call += "?,";
+                }
 
-                    /*Call sproc with values from each row in parameters data table*/
 
-                    SqlCommand Proc = new SqlCommand("dbo." + Sproc, Conn);
-                    Proc.CommandType = CommandType.StoredProcedure;
+                Call += "?)";
 
-                    for (int i = 0; i < Row.Table.Columns.Count - 1 ; i++)
+
+
+                    /*Call Snowflake sproc with values from each row in parameters data table*/
+
+                    OdbcCommand GetHash = new OdbcCommand("call " + Sproc + Call, Connect);
+                    GetHash.CommandType = CommandType.StoredProcedure;
+                    for (int i = 0; i < variables.Length; i++)
                     {
-                        Console.WriteLine("@" + Param[i] + Row[i]);
-                        Proc.Parameters.AddWithValue("@" + Param[i], Row[i]);
+
+                        GetHash.Parameters.AddWithValue("@" + variables[i], Row[i]);
+
                     }
+
+
+
+                    GetHash.Parameters.AddWithValue("@StageName", Stage);
+                    GetHash.Parameters.AddWithValue("@FileName", DBNull.Value);
+
+                /*Get the hash value*/
+
+                var getTimer = Stopwatch.StartNew();
+
+                    string Hash = (string)GetHash.ExecuteScalar();
 
                     getTimer.Stop();
 
                     double ElapseTime = Math.Round(getTimer.ElapsedMilliseconds / 1000.00, 2);
 
-                    /*Export Sql Data to DataTable*/
+                    return Hash + "-" + ElapseTime;
+                }
 
-                    using (var GetResults = new SqlDataAdapter(Proc))
+            catch (OdbcException Ex)
+            {
+                Console.WriteLine("Odbc Error - {0}", Ex.Message.ToString());
+                Console.ReadLine();
+                return null;
+            }
 
+        }
+
+
+        /*Get File from S3 bucket*/
+        static void DownLoadFile(string path, AmazonS3Client Client, string Code)
+
+        {
+            try
+            {
+                GetObjectRequest request = new GetObjectRequest
+                {
+                    BucketName = "sf-returns-fqa-cqa-data",
+                    Key = "EDLD/" + Code + ".csv"
+                };
+
+                using (GetObjectResponse response = Client.GetObject(request))
+                using (Stream responseStream = response.ResponseStream)
+                using (StreamReader r = new StreamReader(responseStream))
+                {
+                    using (var writer = new StreamWriter(path, append: false))
+                        writer.Write(r.ReadToEnd());
+                }
+
+                
+
+            }
+
+            catch (Exception Ex)
+
+            {
+                Console.WriteLine(Ex.Message.ToString());
+                Console.ReadLine();
+
+            }
+
+        }
+
+        /*Extract File*/
+
+        static DataTable ExtractFile(string file)
+        {
+
+
+            /*Read thru each file and load them into DataTable*/
+
+              try
+
+            {
+
+                using (var Re = new StreamReader(file))
+
+                {
+
+                    
+                    DataTable Dt = new DataTable();
+                    
+                    string[] Headers = Regex.Split(Re.ReadLine(), ",");
+                    
+                    
+                    
                     {
-                        GetResults.Fill(SqlCount);
-
-
-                    }
-
-                    foreach (DataColumn col in SqlCount.Columns)
-                    {
-                        if (col.ColumnName.Contains("CompanyName"))
+                        foreach (string Header in Headers)
                         {
-                            for (int i = 0; i < SqlCount.Rows.Count; i++)
-                            {
-                                if ((SqlCount.Rows[i]["CompanyName"].ToString().Contains("'")))
-                                {
-                                    SqlCount.Rows[i]["CompanyName"] = SqlCount.Rows[i]["CompanyName"].ToString().Replace("'", "\\'");
 
-                                }
+                               
+                            Dt.Columns.Add(Header);
 
-                            }
                         }
                     }
+                    while (!Re.EndOfStream)
+                    {
+                        var Rows = Regex.Split(Re.ReadLine(), ",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
 
-                    /*Account for case sesnsitivity and date formats that can affect hash mismatches*/
+
+
+                        if (Rows.Length == Dt.Columns.Count)
+                        {
+                            DataRow Dr = Dt.NewRow();
+                            
+                            Dr.ItemArray = Rows;
+
+                            Dt.Rows.Add(Dr);
+                        }
+
+
+
+                    }
+
+
+                    Console.WriteLine(String.Join(" : ", Dt.Rows[0].ItemArray));
+
+                    foreach (DataRow row in Dt.Rows)
+                    {
+                        foreach (DataColumn col in Dt.Columns)
+                        {
+
+
+                            if (row[col].ToString().Contains("\""))
+                            {
+                                row[col] = row[col].ToString().Substring(1, row[col].ToString().Length - 2);
+                            }
+                        }
+
+                    }
+
+
                     List<string> hashes = new List<string>();
                     List<string> values = new List<string>();
 
+                    /*Transform Data*/
 
-
-                    foreach (DataRow R in SqlCount.Rows)
+                    foreach (DataRow R in Dt.Rows)
                     {
                         List<string> lists = new List<string>();
-
-                        foreach (DataColumn Col in R.Table.Columns)
+                        foreach (DataColumn col in Dt.Columns)
                         {
 
-                            /*      if (Col.ColumnName.Contains("Date") || Col.ColumnName.Contains("DATE"))
-                                  {
-
-                                      Console.WriteLine(Data + " " + Data.GetType());
-                                      string[] Dates = Data.ToString().Split(new char[0]);
-                                      string Date = Dates[0];
-
-                                      lists.Add(Date);
-
-
-                                  } */
-
-                            string Pattern = @"^[0-9]+\.+[0-9]*";
-                            string Data = R[Col].ToString();
+                            string Pattern = @"^[0-9]+\.[0-9]*";
+                            string Data = R[col].ToString();
                             Match w = Regex.Match(Data, Pattern);
 
                             if (w.Success)
                             {
-
                                 lists.Add(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
                             }
 
-                            else if (Col.ColumnName.ToString().ToLower().Contains("total") || Col.ColumnName.ToString().ToLower().Contains("amount"))
+                            else if (col.ColumnName.Contains("DATE") && Data.ToString().Contains("\\"))
+                                {
+
+                                    string[] Dates = Data.ToString().Split('/');
+                                    if (Dates[1].IndexOf("0") == 0)
+                                    {
+
+                                        Dates[1] = Dates[1].Substring(1);
+
+                                    }
+
+                                    if (Dates[2].IndexOf("0") == 0)
+                                    {
+
+                                        Dates[2] = Dates[2].Substring(1);
+
+                                    }
+
+                                    lists.Add(string.Join("/", new[] { Dates[1], Dates[2], Dates[0] }));
+
+                                }
+
+                            else if (col.ColumnName.Contains("DATE") && Data.ToString().Contains('-'))
                             {
-                                lists.Add(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
-                                //Console.WriteLine(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
+
+                                string[] Dates = Data.ToString().Split('-');
+                                if (Dates[1].IndexOf("0") == 0)
+                                {
+
+                                    Dates[1] = Dates[1].Substring(1);
+
+                                }
+
+                                if (Dates[2].IndexOf("0") == 0)
+                                {
+
+                                    Dates[2] = Dates[2].Substring(1);
+
+                                }
+
+                                lists.Add(string.Join("/", new[] { Dates[1], Dates[2], Dates[0] }));
+
                             }
 
                             else if (Data.ToLower() == "null")
-                            {
+                                {
 
-                                lists.Add("");
 
+                                    lists.Add("");
+                                }
+
+                                else
+                                {
+
+                                    lists.Add(Data.ToString().ToLower());
+
+                                }
                             }
-
-                            else
-                            {
-
-
-                                lists.Add(R[Col].ToString().ToLower());
-                            }
-
-                        }
+                        
 
                         var rec = string.Join(",", lists.ToArray());
-                        //Console.WriteLine(rec);
-                        values.Add(rec);
                         
+                        values.Add(rec);
+
+
                     }
 
                     Console.WriteLine(values[0]);
 
-                    using (SHA1Managed sha1 = new SHA1Managed())
-                    {
+                    /*Hash DataRows*/
 
-                        foreach (var value in values)
+                    foreach (var value in values)
+                    {
+                        using (SHA1Managed sha1 = new SHA1Managed())
                         {
+
+                            //Console.WriteLine("S3" + " " + value);
+
 
                             var hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(value));
                             var sb = new StringBuilder(hash.Length * 2);
@@ -235,356 +496,57 @@ namespace MultipleSproc
 
 
                             hashes.Add(sb.ToString());
-                            //Console.WriteLine(value + " " + sb.ToString());
+                            //Console.WriteLine(sb.ToString());
                         }
                     }
 
 
-                    SqlCount.Columns.Add(new DataColumn("hash"));
-                    SqlCount.Columns.Add(new DataColumn("SqlTime"));
+                    Dt.Columns.Add(new DataColumn("hash"));
 
-                    for (int i = 0; i < SqlCount.Rows.Count; i++)
+
+
+                    for (int i = 0; i < Dt.Rows.Count; i++)
                     {
 
-                        SqlCount.Rows[i]["hash"] = hashes[i];
-                        //Console.WriteLine("sql" + " " + hashes[i]);
-                        SqlCount.Rows[i]["SqlTime"] = ElapseTime;
-                    }
-
-                    return SqlCount;
-                }
-
-                catch (SqlException Ex)
-                {
-                    Console.WriteLine(Ex.Message.ToString());
-                    return null;
-                }
-
-            }
-        }
-        static DataTable SnowOps(OdbcConnection Connect, DataRow Row, string Sproc, string[] variables, string Query)
-        {
-
-            var SnowCount = new DataTable();
-            /*Call sproc with values from each row in parameters data table*/
-
-            string Call = "(";
-
-            if (Sproc == "procTopLine")
-
-            {
-
-                SnowCount.Columns.Add("CompanyId");
-                SnowCount.Columns.Add("CompanyName");
-                SnowCount.Columns.Add("DocumentCount");
-                SnowCount.Columns.Add("TotalSalesAmount", typeof(int));
-                SnowCount.Columns.Add("Discount", typeof(int));
-                SnowCount.Columns.Add("TotalExempt", typeof(int));
-                SnowCount.Columns.Add("TaxableSales", typeof(int));
-                SnowCount.Columns.Add("TotalSalesTaxAmount", typeof(int));
-
-
-
-
-
-                for (int i = 0; i < variables.Length; i++)
-                {
-                    Call += "?,";
-                }
-
-
-                Call += "?)";
-
-                try
-                {
-
-                    /*Call Snowflake sproc with values from each row in parameters data table*/
-
-                    OdbcCommand GetHash = new OdbcCommand("call " + Sproc + Call, Connect);
-                    GetHash.CommandType = CommandType.StoredProcedure;
-                    for (int i = 0; i < variables.Length; i++)
-                    {
-
-                        GetHash.Parameters.AddWithValue("@" + variables[i], Row[i]);
+                        Dt.Rows[i]["hash"] = hashes[i];
+                        //Console.WriteLine("S3" + " " + hashes[i]);
 
                     }
 
-
-
-                    GetHash.Parameters.AddWithValue("@ReportUI_uuid", DBNull.Value);
-
-                    /*Get the hash value*/
-
-                    var getTimer = Stopwatch.StartNew();
-
-                    string Hash = (string)GetHash.ExecuteScalar();
-
-                    getTimer.Stop();
-
-                    double ElapseTime = Math.Round(getTimer.ElapsedMilliseconds/1000.00,2);
+                 
+                    return Dt;
 
                     
-
-
-                    /*Select statement with hash value to retrieve result set*/
-
-                    OdbcCommand GetDocs = new OdbcCommand(Query + " where UUID = ? ", Connect);
-                    GetDocs.Parameters.AddWithValue("@Hash", Hash);
-
-                    /*Export result set to data table*/
-
-                    
-                    using (var DocsResults = new OdbcDataAdapter(GetDocs))
-
-                    {
-                        DocsResults.Fill(SnowCount);
-
-
-                    }
-
-
-                    foreach (DataColumn col in SnowCount.Columns)
-                    {
-                        if (col.ColumnName.Contains("CompanyName"))
-                        {
-                            for (int i = 0; i < SnowCount.Rows.Count; i++)
-                            {
-                                if ((SnowCount.Rows[i]["CompanyName"].ToString().Contains("'")))
-                                {
-                                    SnowCount.Rows[i]["CompanyName"] = SnowCount.Rows[i]["CompanyName"].ToString().Replace("'", "\\'");
-
-                                }
-
-                            }
-                        }
-                    }
-
-                    SnowCount.Columns.Add(new DataColumn("SnowTime"));
-
-                    for (int i = 0; i < SnowCount.Rows.Count; i++)
-                    {
-
-                        SnowCount.Rows[i]["SnowTime"] = ElapseTime;
-                        
-
-                    }
-
-                    return SnowCount;
-
                 }
-
-                catch (Exception Ex)
-                {
-                    Console.WriteLine(Ex.Message.ToString());
-                    return null;
-                }
-
-
-
             }
-
-            else
+            catch (IOException Ex)
             {
-
-                for (int i = 0; i < variables.Length; i++)
-                {
-                    Call += "?,";
-                }
-
-
-                Call += "?)";
-
-
-                try
-                {
-
-                    /*Call Snowflake sproc with values from each row in parameters data table*/
-
-                    OdbcCommand GetHash = new OdbcCommand("call " + Sproc + Call, Connect);
-                    GetHash.CommandType = CommandType.StoredProcedure;
-                    for (int i = 0; i < variables.Length; i++)
-                    {
-
-                        GetHash.Parameters.AddWithValue("@" + variables[i], Row[i]);
-
-                    }
-
-
-
-                    GetHash.Parameters.AddWithValue("@ReportUI_uuid", DBNull.Value);
-
-                    /*Get the hash value*/
-
-                    var getTimer = Stopwatch.StartNew();
-
-                    string Hash = (string)GetHash.ExecuteScalar();
-
-                    getTimer.Stop();
-
-                    double ElapseTime = Math.Round(getTimer.ElapsedMilliseconds/1000.00, 2);
-
-
-                    /*Select statement with hash value to retrieve result set*/
-
-                    OdbcCommand GetDocs = new OdbcCommand(Query + " where UUID = ? ", Connect);
-                    GetDocs.Parameters.AddWithValue("@Hash", Hash);
-
-                    /*Export result set to data table*/
-
-                    using (var DocsResults = new OdbcDataAdapter(GetDocs))
-
-                    {
-                        DocsResults.Fill(SnowCount);
-
-
-                    }
-
-
-                    /*Account for case sesnsitivity and date formats that can affect hash mismatches*/
-                    List<string> hashes = new List<string>();
-                    List<string> values = new List<string>();
-                   
-                    foreach (DataColumn col in SnowCount.Columns)
-                    {
-                        if (col.ColumnName.Contains("CompanyName"))
-                        {
-                            for (int i = 0; i < SnowCount.Rows.Count; i++)
-                            {
-                                if ((SnowCount.Rows[i]["CompanyName"].ToString().Contains("'")))
-                                {
-                                    SnowCount.Rows[i]["CompanyName"] = SnowCount.Rows[i]["CompanyName"].ToString().Replace("'", "\\'");
-
-                                }
-
-                            }
-                        }
-                    }
-
-
-                    foreach (DataRow R in SnowCount.Rows)
-                    {
-                        List<string> lists = new List<string>();
-
-                        foreach (DataColumn Col in R.Table.Columns)
-                        {
-
-                            /*   if (Col.ColumnName.Contains("Date") || Col.ColumnName.Contains("DATE"))
-                               {
-
-                                   Console.WriteLine(Data + " " + Data.GetType());
-                                   string[] Dates = Data.ToString().Split(new char[0]);
-                                   string Date = Dates[0];
-
-                                   lists.Add(Date);
-
-
-                               }*/
-
-                            string Pattern = @"^[0-9]+\.+[0-9]*";
-                            string Data = R[Col].ToString();
-                            Match w = Regex.Match(Data, Pattern);
-
-                            if (w.Success)
-                            {
-
-                                lists.Add(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
-                            }
-
-                            else if (Col.ColumnName.Contains("TOTAL") || Col.ColumnName.Contains("AMOUNT"))
-                            {
-                                lists.Add(Convert.ToInt64(Convert.ToDouble(Data)).ToString());
-
-                            }
-
-                            else if (Data.ToLower() == "null")
-                            {
-
-                                lists.Add("");
-
-                            }
-
-                            else
-                            {
-
-                                lists.Add(R[Col].ToString().ToLower());
-                            }
-
-                        }
-
-                        var rec = string.Join(",", lists.ToArray());
-                        //Console.WriteLine(rec);
-                        values.Add(rec);
-                        
-                    }
-
-                    Console.WriteLine(values[0]);
-
-                    using (SHA1Managed sha1 = new SHA1Managed())
-                    {
-                        foreach (var value in values)
-                        {
-
-                            var hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(value));
-                            var sb = new StringBuilder(hash.Length * 2);
-
-
-
-                            foreach (byte b in hash)
-                            {
-                                // convert to hexidecimal
-                                sb.Append(b.ToString("X2"));
-                            }
-
-
-                            hashes.Add(sb.ToString());
-                           // Console.WriteLine(value + " " + sb.ToString());
-                        }
-                    }
-
-                    SnowCount.Columns.Add(new DataColumn("hash"));
-                    SnowCount.Columns.Add(new DataColumn("SnowTime"));
-
-                    for (int i = 0; i < SnowCount.Rows.Count; i++)
-                    {
-
-                        SnowCount.Rows[i]["hash"] = hashes[i];
-                        //Console.WriteLine("Snow " + " " + hashes[i]);
-                        SnowCount.Rows[i]["SnowTime"] = ElapseTime;
-
-                    }
-
-
-
-                    return SnowCount;
-                }
-
-                catch (OdbcException Ex)
-                {
-
-                    Console.WriteLine(Ex.Message.ToString());
-
-                    return null;
-                }
+                Console.WriteLine("IO Error - {0}", Ex.Message.ToString());
+                Console.ReadLine();
+                return null;
             }
+           
+
         }
-        static void MatchOnly(DataTable dt, DataTable dt1, string Company, string StartDate, string EndDate, string ProcName, OdbcConnection Conn, int TableId)
+
+        static void MatchOnly(DataTable dt, DataTable dt1, string Company, string StartDate, string EndDate, string ProcName, OdbcConnection Conn, int TableId, double sfexec)
 
         {
-
+            
             string TestResult;
             string TestName = Company + "_" + StartDate + "_" + EndDate;
             string Today = DateTime.Now.ToString("MM-dd-yyyy HH:mm:ss");
             string RowName = "RowCount";
-            double SnowTime = Convert.ToDouble(dt1.Rows[0]["SnowTime"]);
+            double SnowTime = sfexec;
             double SqlTime = Convert.ToDouble(dt.Rows[0]["SqlTime"]);
 
             if (dt.Rows.Count == dt1.Rows.Count)
             {
 
-                TestResult = "Pass";
-            }
+                 TestResult = "Pass";
+             }
 
-            else { TestResult = "Fail"; }
+             else { TestResult = "Fail"; }
 
             Console.WriteLine(TestResult);
 
@@ -593,60 +555,35 @@ namespace MultipleSproc
             OdbcCommand Ins = new OdbcCommand(OdbcComm, Conn);
 
             Ins.ExecuteNonQuery();
+ 
 
 
-
-            /*  var Inner = from Snow in dt1.AsEnumerable()
-                          join
-                    Sql in dt.AsEnumerable() on
-                    Snow.Field<string>("hash") equals Sql.Field<string>("hash")
-                          select Snow; */
+          /*  var Inner = from Snow in dt1.AsEnumerable()
+                        join
+                  Sql in dt.AsEnumerable() on
+                  Snow.Field<string>("hash") equals Sql.Field<string>("hash")
+                        select Snow; */
 
             /*Snowflake only datarows*/
 
             var OnlySnow = from Snow in dt1.AsEnumerable()
-                           join
-                     Sql in dt.AsEnumerable() on
-                     Snow.Field<string>("hash") equals Sql.Field<string>("hash")
-                     into x
+                       join
+                 Sql in dt.AsEnumerable() on
+                 Snow.Field<string>("hash") equals Sql.Field<string>("hash")
+                 into x
                            from Sql in x.DefaultIfEmpty()
                            where Sql == null
                            select Snow;
 
-
-
-            foreach (var Snow in OnlySnow)
+               foreach (var Snow in OnlySnow)
             {
 
-                List<string> lists = new List<string>();
-
-                foreach (DataColumn col in Snow.Table.Columns)
-                {
-
-
-                    if (col.ColumnName.Contains("DATE"))
-                    {
-                        string Data = Snow[col].ToString();
-                        Console.WriteLine(Data + " " + Data.GetType());
-                        string[] Dates = Data.ToString().Split(new char[0]);
-                        string Date = Dates[0];
-                        Console.WriteLine(Date);
-                        lists.Add(Date);
-
-
-                    }
-                    else
-                    {
-                        lists.Add(Snow[col].ToString());
-                    }
-                }
-
+                
                 string Hash = Snow["hash"].ToString();
+                var rec = string.Join("','", Snow.ItemArray.ToArray());
+                Console.WriteLine(Hash);
 
-                lists.RemoveAt(lists.Count - 1);
-                var rec = string.Join("','", lists);
-                Console.WriteLine(rec);
-                string InsertHash = "Insert into UnitTests Values('" + TestName + "','" + "RowHash" + "','" + Hash + "','" + " " + "','" + "Fail" + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime +  "')";
+                string InsertHash = "Insert into UnitTests Values('" + TestName + "','" + "RowHash" + "','" + Hash + "','" + " " + "','" + "Fail" + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
 
                 OdbcCommand InsertH = new OdbcCommand(InsertHash, Conn);
 
@@ -654,7 +591,7 @@ namespace MultipleSproc
 
 
                 string Insert = "Insert into " + ProcName + " Values('" + rec + "','" + Today + "','" + TestName + "')";
-                Console.WriteLine(Insert);
+                
                 OdbcCommand InsertData = new OdbcCommand(Insert, Conn);
 
                 InsertData.ExecuteNonQuery();
@@ -669,41 +606,24 @@ namespace MultipleSproc
                       on
                      Sql.Field<string>("hash") equals Snow.Field<string>("hash")
                      into x
-                          from Snow in x.DefaultIfEmpty()
-                          where Snow == null
-                          select Sql;
+                           from Snow in x.DefaultIfEmpty()
+                           where Snow == null
+                           select Sql;
 
 
             foreach (var Sql in OnlySql)
-            {
+             {
 
-                List<string> lists = new List<string>();
-
-
-                foreach (DataColumn col in Sql.Table.Columns)
+              /*  foreach (DataColumn col in Sql.Table.Columns)
                 {
-                    if (col.ColumnName.Contains("Date") || col.ColumnName.Contains("DATE"))
-                    {
-                        string Data = Sql[col].ToString();
-                        Console.WriteLine(Data + " " + Data.GetType());
-                        string[] Dates = Data.ToString().Split(new char[0]);
-                        string Date = Dates[0];
+                    Console.WriteLine(col.ColumnName + " " + Sql[col].GetType());
+                } */
 
-
-                        lists.Add(Date);
-
-                    }
-
-                    else
-                    {
-                        lists.Add(Sql[col].ToString());
-                    }
-                }
                 string Hash = Sql["hash"].ToString();
-                lists.RemoveAt(lists.Count - 1);
-                var rec = string.Join("','", lists);
-                Console.WriteLine(rec);
-                string InsertHash = "Insert into UnitTests Values('" + TestName + "','" + "RowHash" + "','" + " " + "','" + Hash + "','" + "Fail" + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
+                var rec = string.Join("','", Sql.ItemArray.ToArray());
+                Console.WriteLine(Hash);
+
+                string InsertHash =  "Insert into UnitTests Values('" + TestName + "','" + "RowHash" + "','" + " " + "','" + Hash + "','" + "Fail" + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
 
                 OdbcCommand InsertH = new OdbcCommand(InsertHash, Conn);
 
@@ -714,79 +634,24 @@ namespace MultipleSproc
                 OdbcCommand InsertData = new OdbcCommand(Insert, Conn);
 
                 InsertData.ExecuteNonQuery();
-            }
+            } 
         }
 
-        static void MatchAggOnly(DataTable dt, DataTable dt1, string Company, string StartDate, string EndDate, string ProcName, OdbcConnection Conn, int TableId)
-        {
-            string TestResult;
-            string TestName = Company + "_" + StartDate + "_" + EndDate;
-            string Today = DateTime.Now.ToString("MM-dd-yyyy HH:mm:ss");
-            double SnowTime = Convert.ToDouble(dt1.Rows[0]["SnowTime"]);
-            double SqlTime = Convert.ToDouble(dt.Rows[0]["SqlTime"]);
-
-            List<string> Metrics = new List<string>();
-
-            Metrics.Add("CompanyId");
-            Metrics.Add("CompanyName");
-            Metrics.Add("DocumentCount");
-            Metrics.Add("TotalSalesAmount");
-            Metrics.Add("Discount");
-            Metrics.Add("TaxableSales");
-            Metrics.Add("TotalExempt");
-            Metrics.Add("TotalSalesTaxAmount");
-
-            if (dt.Rows.Count == dt1.Rows.Count)
-            {
-
-                TestResult = "Pass";
-            }
-
-            else { TestResult = "Fail"; }
-
-            string Command = "Insert into UnitTests Values('" + TestName + "','" + "RowCount" + "','" + dt1.Rows.Count + "','" + dt.Rows.Count + "','" + TestResult + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
-
-            OdbcCommand Ins = new OdbcCommand(Command, Conn);
-
-            Ins.ExecuteNonQuery();
-
-            for (int i = 0; i < dt.Rows.Count; i++)
-            {
-
-                foreach (string Metric in Metrics)
-                {
-                    if (dt1.Rows[i][Metric].ToString().ToLower() == dt.Rows[i][Metric].ToString().ToLower())
-                    {
-                        TestResult = "Pass";
-                        string Comm = "Insert into UnitTests Values('" + TestName + "','" + Metric + "','" + dt1.Rows[i][Metric].ToString() + "','" + dt.Rows[i][Metric].ToString() + "','" + TestResult + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
-                        Console.WriteLine(Comm);
-
-                        OdbcCommand Query = new OdbcCommand(Comm, Conn);
-                        Query.ExecuteNonQuery();
-                    }
-
-                    else
-                    {
-                        TestResult = "Fail";
-
-                        string Comm = "Insert into UnitTests Values('" + TestName + "','" + Metric + "','" + dt1.Rows[i][Metric].ToString() + "','" + dt.Rows[i][Metric].ToString() + "','" + TestResult + "','" + Today + "','" + ProcName + "','" + TableId + "','" + SnowTime + "','" + SqlTime + "')";
-                        Console.WriteLine(Comm);
-
-                        OdbcCommand Query = new OdbcCommand(Comm, Conn);
-                        Query.ExecuteNonQuery();
-                    }
-                }
-            }
-        }
         static void Main(string[] args)
         {
+
+            /*Sleep for 1.5 minute*/
+
+            //Thread.Sleep(90000);
+            DataTable Pdt = new DataTable();
+            DataTable RawFile = new DataTable();
+            string ProcName = "procExportDocumentLineDetail";
+            StringBuilder SqlQuery = new StringBuilder("Select ");
+            string ReportHash;
 
             string SqlConn = ConfigurationManager.ConnectionStrings["SqlProdConn"].ConnectionString;
             string Connect = ConfigurationManager.ConnectionStrings["ProdConnection"].ConnectionString;
             string Target = ConfigurationManager.ConnectionStrings["ProdConnectionTarget"].ConnectionString;
-
-
-
 
             using (SqlConnection Conn = new SqlConnection(SqlConn))
             {
@@ -800,185 +665,135 @@ namespace MultipleSproc
                     {
 
                         TConnection.Open();
-                        List<string> ProcNames = new List<string>();
-
-
 
                         try
+
                         {
-                            /*iterate thru procnames*/
+                            string command = "Select Parameters from nUnitTesting where ProcName = '" + ProcName + "'";
 
+                            Console.WriteLine(command);
 
-                            //ProcNames.Add("procTopLine");
-                            //ProcNames.Add("procDocumentSummaryReport");
-                            // ProcNames.Add("procRptSalesUseTaxJurisDetail_Recap");
+                            OdbcCommand GetValuesNames = new OdbcCommand(command, SnowConnection);
 
-                            // ProcNames.Add("procRptDocumentSummaryByListing");
-                            //ProcNames.Add("procRptTaxByJurisReport");
-                            //  ProcNames.Add("procRptTaxJurisDetailView_CombinedViewTaxingJuris");
-                            //ProcNames.Add("procRptReconcileDocLineDetail");
+                            string Para = (string)GetValuesNames.ExecuteScalar();
 
-                            OdbcCommand GetProcs = new OdbcCommand("Select distinct ProcName from nUnitTesting where IsExport = 'FALSE' and ProcName = 'procRptSalesUseTaxJurisdiction'", SnowConnection);
-                            OdbcDataReader ResultVal = GetProcs.ExecuteReader();
+                            string[] Parameters = Para.Split(',');
 
-                            while (ResultVal.Read())
+                            for (int NumParams = 1; NumParams < Parameters.Length; NumParams++)
                             {
-                                ProcNames.Add(ResultVal["ProcName"].ToString());
+
+
+                                SqlQuery.Append("Para" + NumParams + ", ");
 
                             }
 
-                            foreach (string ProcName in ProcNames)
+
+                            /*With Parameters.Length, we can get the actual values for each of the parameters from the control table*/
+
+                            SqlQuery.Append("Para" + Parameters.Length + " ,TableId,StageName" + " from nUnitTesting where ProcName = '" + ProcName + "'");
+
+                            Console.WriteLine(SqlQuery.ToString());
+
+                            /* for (int NumParams = 1; NumParams < Parameters.Length; NumParams++)
+                             {
+
+
+                                 SqlQuery.Append("Para" + NumParams + ", ");
+
+                             }
+
+                             /*Get the number of parameters for that procName
+
+                            SqlQuery.Append("Para" + Parameters.Length + " from dbo.nUnitTesting where ProcName = '" + ProcName + "'");
+
+                            Console.WriteLine(SqlQuery.ToString()); */
+
+
+
+                            /*Select the parameter permutations and store them in Parameters data table*/
+
+                            OdbcCommand GetParameterValues = new OdbcCommand(SqlQuery.ToString(), SnowConnection);
+
+                            using (var Y = new OdbcDataAdapter(GetParameterValues))
                             {
-                                Console.WriteLine(ProcName);
+                                Y.Fill(Pdt);
 
-                                DataTable Pdt = new DataTable();
-                                int x, y, z;
-                                StringBuilder SqlQuery = new StringBuilder("Select ");
+                            }
 
+                            foreach (DataRow dr in Pdt.Rows)
+                            {
+                                DataTable Tab = new DataTable();
+                                DataTable S3Tab = new DataTable();
 
-                                /*Get Parameter Names from control table*/
+                                string StartDate = dr["Para3"].ToString();
+                                string EndDate = dr["Para4"].ToString();
+                                string Company = dr["Para2"].ToString();
+                                var TableId = Convert.ToInt32(dr["TableId"].ToString());
+                                var StageName = dr["StageName"].ToString();
 
-
-                                string Query;
-
-
-                                OdbcCommand GetValuesNames = new OdbcCommand("Select Parameters from nUnitTesting where ProcName = '" + ProcName + "'", SnowConnection);
-
-                                string Para = (string)GetValuesNames.ExecuteScalar();
-
-
-
-                                string[] Parameters = Para.Split(",");
-
-
-
-                                x = ((Array.IndexOf(Parameters, "CompanyId") == -1) || String.IsNullOrEmpty(Parameters[Array.IndexOf(Parameters, "CompanyId")])) ? Array.IndexOf(Parameters, "ParentId") : Array.IndexOf(Parameters, "CompanyId");
-                                Console.WriteLine(x);
-                                y = Array.IndexOf(Parameters, "StartDate");
-                                z = Array.IndexOf(Parameters, "EndDate");
-                                Console.WriteLine(x + "," + y + "," + z);
-
-                                for (int NumParams = 1; NumParams < Parameters.Length; NumParams++)
+                                try
                                 {
 
+                                    string dir = @"C:\Users\franco.mang\Desktop\s3\";
 
-                                    SqlQuery.Append("Para" + NumParams + ", ");
+                                    var sharedFile = new SharedCredentialsFile();
 
-                                }
+                                    sharedFile.TryGetProfile("default", out var profile);
 
 
-                                /*With Parameters.Length, we can get the actual values for each of the parameters from the control table*/
+                                    AWSCredentialsFactory.TryGetAWSCredentials(profile, sharedFile, out var credentials);
 
-                                SqlQuery.Append("Para" + Parameters.Length + " ,TableId" + " from nUnitTesting where ProcName = '" + ProcName + "'");
 
-                                Console.WriteLine(SqlQuery.ToString());
 
-                                OdbcCommand GetParameterValues = new OdbcCommand(SqlQuery.ToString(), SnowConnection);
+                                    AmazonS3Client s3Client = new AmazonS3Client(credentials);
 
-                                /* Store all permutations in our parameters datatable*/
+                                    ReportHash = GetHash(SnowConnection, dr, ProcName, Parameters, StageName);
 
-                                using (var Y = new OdbcDataAdapter(GetParameterValues))
-                                {
-                                    Y.Fill(Pdt);
+                                    string Hash = ReportHash.Split('-')[0];
 
-                                }
+                                    string path = dir + Hash + ".csv";
 
-                                
-                        
-                                /* For each permutation in our permuations datatable, make a call to snowflake & sql server to get result sets*/
+                                    var sfexec = Convert.ToDouble(ReportHash.Split('-')[1]);
 
-                                OdbcCommand GetSnowTable = new OdbcCommand("Select SnowflakeTable from nUnitTesting where ProcName = '" + ProcName + "'", SnowConnection);
-
-                                string SnowflakeTable = GetSnowTable.ExecuteScalar().ToString();
-
-                                Console.WriteLine(SnowflakeTable);
-
-                                foreach (DataRow dr in Pdt.Rows)
-                                {
-                                    List<string> DC = new List<string>();
-
-                                    DataTable Tab;
-                                    DataTable SnowTab;
-                                    var TableId = Convert.ToInt32(dr["TableId"].ToString());
-
+                                    DownLoadFile(path, s3Client, Hash);
 
                                     Tab = QueryOps(Conn, dr, ProcName, Parameters);
 
+                                    S3Tab = ExtractFile(path);
 
-                                    if (ProcName != "procTopLine")
-                                    {
-                                        for (int i = 0; i < Tab.Columns.Count - 2; i++)
-                                        {
-                                            DC.Add(Tab.Columns[i].ColumnName);
-
-                                        }
-
-                                        Query = "Select " + string.Join(",", DC) + " from " + SnowflakeTable;
-
-                                        Console.WriteLine(Query);
-                                    }
-
-                                    else
-                                    {
-                                        for (int i = 0; i < Tab.Columns.Count - 1; i++)
-                                        {
-                                            DC.Add(Tab.Columns[i].ColumnName);
-
-                                        }
-
-                                        Query = "Select " + string.Join(",", DC) + " from " + SnowflakeTable;
-
-                                        Console.WriteLine(Query);
-
-                                    }
+                                    Console.WriteLine("SqlCount" + " " + Tab.Rows.Count);
+                                    Console.WriteLine("S3Count" + " " + S3Tab.Rows.Count);
+                                    Console.ReadLine();
 
 
+                                    //MatchOnly(Tab, S3Tab, Company, StartDate, EndDate, ProcName, TConnection, TableId, sfexec);
 
-                                    SnowTab = SnowOps(SnowConnection, dr, ProcName, Parameters, Query);
-
-                                    string CompanyId = dr[x].ToString();
-                                    string StartDate = dr[y].ToString();
-                                    string EndDate = dr[z].ToString();
-
-                                    /*Get Column DataType
-                                    foreach (DataColumn Col in Tab.Columns)
-                                        {
-
-                                              Console.WriteLine(Tab.Rows[0][Col].GetType());
-
-                                        } */
-                                   
-                                   // Console.WriteLine(Tab.Rows.Count);
-
-                                   // Console.WriteLine(SnowTab.Rows.Count);
-
-
-
-                                    if (ProcName == "procTopLine")
-                                    {
-
-                                       MatchAggOnly(Tab, SnowTab, CompanyId, StartDate, EndDate, ProcName, TConnection, TableId);
-
-                                    }
-
-                                    else
-                                    {
-                                       // MatchOnly(Tab, SnowTab, CompanyId, StartDate, EndDate, ProcName, TConnection, TableId);
-                                    }
                                 }
+                                catch (Exception Ex)
+                                {
+                                    Console.WriteLine("AWS Error - {0}", Ex.Message.ToString());
+                                    Console.WriteLine(Ex.ToString());
+                                    Console.ReadLine();
 
-
+                                }
                             }
                         }
+
                         catch (SqlException Ex)
                         {
 
                             Console.WriteLine(Ex.Message.ToString());
+                            Console.ReadLine();
 
                         }
+
+
+
                     }
                 }
             }
+                }
+            }
         }
-    }
-}
+       
+            
